@@ -1,6 +1,7 @@
 services:
   bhop:
     build: .
+    platform: linux/amd64
     image: bhop-css:latest
     container_name: bhop-server
     restart: unless-stopped

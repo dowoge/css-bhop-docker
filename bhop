@@ -19,6 +19,16 @@ command -v docker >/dev/null 2>&1 || fail "docker is not installed. See https://
 docker compose version >/dev/null 2>&1 || fail "the 'docker compose' plugin is not installed."
 docker info >/dev/null 2>&1 || fail "cannot reach the docker daemon. Is it running? Are you in the 'docker' group?"
 
+case "$(uname -m)" in
+    aarch64|arm64)
+        if [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ] || [ ! -e /proc/sys/fs/binfmt_misc/qemu-i386 ]; then
+            say "${C_YELLOW}ARM host: registering QEMU x86 emulation (srcds is 32-bit x86 only)${C_OFF}"
+            docker run --privileged --rm tonistiigi/binfmt --install amd64,386 >/dev/null \
+                || fail "could not register QEMU emulation"
+        fi
+        ;;
+esac
+
 running() {
     docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true
 }
@@ -82,6 +92,7 @@ cmd_config() {
     [ -s .env ] || first=1
     (umask 077; touch .env)
     docker run --rm -it \
+        --platform linux/amd64 \
         -u "$(id -u):$(id -g)" \
         -e HOME=/tmp \
         -e HOST_UID="$(id -u)" \
