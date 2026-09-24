@@ -7,6 +7,7 @@ RUN dpkg --add-architecture i386 \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        fzf \
         gosu \
         lib32gcc-s1 \
         lib32stdc++6 \
@@ -16,6 +17,7 @@ RUN dpkg --add-architecture i386 \
         procps \
         tar \
         unzip \
+        whiptail \
  && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 1000 steam \
@@ -28,7 +30,8 @@ RUN curl -sSL https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.ta
  && chown -R steam:steam /opt/steamcmd
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY bhop-tool /usr/local/bin/bhop-tool
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/bhop-tool
 
 WORKDIR /server
 

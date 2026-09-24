@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE=/config/.env
+CSTRIKE_DIR=/server/cstrike
+CFG_DIR="$CSTRIKE_DIR/cfg"
+SM_DIR="$CSTRIKE_DIR/addons/sourcemod"
+TITLE="CS:S Bhop Server"
+
+SETTINGS=(
+    "SV_HOSTNAME|Server hostname|CS:S Bhop Server"
+    "MAP|Starting map|bhop_furame"
+    "MAXPLAYERS|Max players|16"
+    "TICKRATE|Tickrate (>66 auto-installs TickrateEnabler)|100"
+    "PORT|Game port (UDP/TCP)|27015"
+    "SOURCETV_PORT|SourceTV port (UDP)|27020"
+    "SV_LAN|LAN mode (1 = LAN, 0 = internet)|1"
+    "BOT_QUOTA|Bots to keep online (>=1 keeps server out of hibernation)|1"
+    "MM_VERSION|MetaMod:Source branch|1.12"
+    "SM_VERSION|SourceMod branch|1.12"
+    "RCON_PASSWORD|RCON password|"
+    "SV_PASSWORD|Server password|"
+)
+SECRETS=" RCON_PASSWORD SV_PASSWORD "
+
+box() { whiptail --title "$TITLE" "$@" 3>&1 1>&2 2>&3; }
+msg() { whiptail --title "$TITLE" --msgbox "$1" 0 0; }
+
+load_env() {
+    [ -f "$ENV_FILE" ] || return 0
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|\#*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        if [ "${val:0:1}" = '"' ] && [ "${val: -1}" = '"' ]; then
+            val="${val:1:${#val}-2}"
+            val="${val//\\\"/\"}"
+            val="${val//\\\\/\\}"
+        elif [ "${val:0:1}" = "'" ] && [ "${val: -1}" = "'" ]; then
+            val="${val:1:${#val}-2}"
+        fi
+        printf -v "ENV_$key" '%s' "$val"
+    done < "$ENV_FILE"
+}
+
+env_get() {
+    local var="ENV_$1"
+    printf '%s' "${!var-$2}"
+}
+
+qval() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+save_env() {
+    local entry key
+    {
+        printf 'PUID=%s\n' "${HOST_UID:-$(env_get PUID 1000)}"
+        printf 'PGID=%s\n' "${HOST_GID:-$(env_get PGID 1000)}"
+        for entry in "${SETTINGS[@]}"; do
+            key="${entry%%|*}"
+            printf '%s=%s\n' "$key" "$(qval "$(env_get "$key" "${entry##*|}")")"
+        done
+        printf 'DISABLED_PLUGINS=%s\n' "$(qval "$(env_get DISABLED_PLUGINS "")")"
+    } > "$ENV_FILE"
+}
+
+server_settings() {
+    local entry key desc def val items choice
+    while true; do
+        items=()
+        for entry in "${SETTINGS[@]}"; do
+            IFS='|' read -r key desc def <<< "$entry"
+            val=$(env_get "$key" "$def")
+            [[ "$SECRETS" == *" $key "* ]] && val=${val:+********}
+            items+=("$key" "${val:-<none>}")
+        done
+        choice=$(box --menu "Server settings (saved to .env)" 0 0 0 "${items[@]}") || return 0
+        for entry in "${SETTINGS[@]}"; do
+            IFS='|' read -r key desc def <<< "$entry"
+            [ "$key" = "$choice" ] && break
+        done
+        if [[ "$SECRETS" == *" $key "* ]]; then
+            val=$(box --passwordbox "$desc (blank to clear)" 0 60) || continue
+        else
+            val=$(box --inputbox "$desc" 0 60 "$(env_get "$key" "$def")") || continue
+        fi
+        printf -v "ENV_$key" '%s' "$val"
+        save_env
+    done
+}
+
+plugin_names() {
+    sed -nE 's/^ +install_(repo|ext|file|sp) +(--lib +)?([a-z0-9-]+) .*/\3/p' /usr/local/bin/entrypoint.sh
+}
+
+plugins_menu() {
+    local disabled name items=() picked
+    disabled=" $(env_get DISABLED_PLUGINS "" | tr ',' ' ') "
+    while IFS= read -r name; do
+        if [[ "$disabled" == *" $name "* ]]; then
+            items+=("$name" "" OFF)
+        else
+            items+=("$name" "" ON)
+        fi
+    done < <(plugin_names)
+    picked=" $(box --separate-output --checklist "Enabled plugins and extensions (space toggles)" 0 50 0 "${items[@]}" | tr '\n' ' ') " || return 0
+    disabled=""
+    while IFS= read -r name; do
+        [[ "$picked" == *" $name "* ]] || disabled+="$name "
+    done < <(plugin_names)
+    ENV_DISABLED_PLUGINS="${disabled% }"
+    save_env
+}
+
+need_server() {
+    [ -d "$1" ] && return 0
+    msg "Nothing here yet. Start the server once so it installs SourceMod and plugins, then come back."
+    return 1
+}
+
+get_cvar() {
+    [ -f "$1" ] || return 0
+    awk -v n="$2" '$1 == n { v = $0; sub(/^[^ \t]+[ \t]+/, "", v); gsub(/^"|"[ \t]*$/, "", v); print v }' "$1" | tail -n1
+}
+
+set_cvar() {
+    local file="$1" name="$2" val="${3//\"/}" tmp
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    tmp=$(mktemp)
+    awk -v n="$name" -v v="$val" '
+        $1 == n { print n " \"" v "\""; done = 1; next }
+        { print }
+        END { if (!done) print n " \"" v "\"" }' "$file" > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+edit_cvar() {
+    local file="$1" name="$2" desc="${3:-}" val
+    val=$(box --inputbox "$name${desc:+\n\n$desc}\n\n$(basename "$file")" 0 70 "$(get_cvar "$file" "$name")") || return 0
+    set_cvar "$file" "$name" "$val"
+}
+
+api_keys() {
+    need_server "$CFG_DIR" || return 0
+    local wrsj="$CFG_DIR/sourcemod/plugin.wrsj.cfg" osdb="$CFG_DIR/sourcemod/plugin.offstyledb.cfg" choice
+    while true; do
+        choice=$(box --menu "Plugin API keys (applied on restart)" 0 0 0 \
+            sj_api_key       "wrsj: SourceJump API key [$(get_cvar "$wrsj" sj_api_key)]" \
+            OSdb_private_key "offstyledb: Offstyles API key [$(get_cvar "$osdb" OSdb_private_key)]" \
+            OSdb_public_ip   "offstyledb: this server's public IP:PORT [$(get_cvar "$osdb" OSdb_public_ip)]") || return 0
+        case "$choice" in
+            sj_api_key) edit_cvar "$wrsj" "$choice" ;;
+            *)          edit_cvar "$osdb" "$choice" ;;
+        esac
+    done
+}
+
+list_editor() {
+    local file="$1" label="$2" fmt="$3" entries=() line choice val flags
+    touch "$file"
+    while true; do
+        entries=()
+        while IFS= read -r line; do
+            entries+=("$line" "")
+        done < <(grep -vE '^[[:space:]]*(;|//|$)' "$file")
+        choice=$(box --menu "$label\n\nSelect an entry to remove it." 0 0 0 "+ Add" "" "${entries[@]}") || return 0
+        if [ "$choice" = "+ Add" ]; then
+            val=$(box --inputbox "SteamID (STEAM_0:1:123, [U:1:123])$([ "$fmt" = "wl" ] && echo ", IP, or group ID")" 0 60) || continue
+            [ -n "$val" ] || continue
+            if [ "$fmt" = "admin" ]; then
+                flags=$(box --inputbox "Immunity:flags (99:z = full root admin)" 0 60 "99:z") || continue
+                printf '"%s" "%s"\n' "$val" "$flags" >> "$file"
+            else
+                printf '%s\n' "$val" >> "$file"
+            fi
+        elif box --yesno "Remove $choice?" 0 0; then
+            grep -vxF -- "$choice" "$file" > "$file.tmp" || true
+            cat "$file.tmp" > "$file"
+            rm -f "$file.tmp"
+        fi
+    done
+}
+
+whitelist_menu() {
+    need_server "$SM_DIR/configs" || return 0
+    local cfg="$CFG_DIR/sourcemod/plugin.whitelist.cfg" state choice
+    while true; do
+        state=$(get_cvar "$cfg" whitelist_enabled)
+        choice=$(box --menu "Whitelist (smwhitelist)" 0 0 0 \
+            toggle  "Whitelist is $([ "$state" = "1" ] && echo ON || echo OFF), select to toggle" \
+            entries "Edit allowed players") || return 0
+        case "$choice" in
+            toggle)  set_cvar "$cfg" whitelist_enabled "$([ "$state" = "1" ] && echo 0 || echo 1)" ;;
+            entries) list_editor "$SM_DIR/configs/whitelist.txt" "Whitelisted players" "wl" ;;
+        esac
+    done
+}
+
+admins_menu() {
+    need_server "$SM_DIR/configs" || return 0
+    list_editor "$SM_DIR/configs/admins_simple.ini" "SourceMod admins" "admin"
+}
+
+cvar_rows() {
+    awk '
+        FNR == 1 { desc = "" }
+        /^[ \t]*$/ { desc = ""; next }
+        /^\/\// {
+            l = $0; sub(/^\/\/[ \t]*/, "", l)
+            if (desc == "" && l != "-" && l !~ /^(Default|Minimum|Maximum):/) desc = l
+            next
+        }
+        /^[A-Za-z_][A-Za-z0-9_.]*[ \t]/ {
+            if ($1 ~ /^(exec|echo|alias|bind)$/) next
+            v = $0; sub(/^[^ \t]+[ \t]+/, "", v); gsub(/^"|"[ \t]*$/, "", v)
+            f = FILENAME; sub(/.*\/cfg\//, "", f)
+            printf "%-40s %-24s %s\t%s\t%s\t%s\n", $1, v, f, $1, FILENAME, desc
+            desc = ""
+        }' "$CFG_DIR"/server.cfg "$CFG_DIR"/sourcemod/*.cfg 2>/dev/null
+}
+
+cvar_search() {
+    need_server "$CFG_DIR/sourcemod" || return 0
+    local out rc query row name file desc val
+    while true; do
+        rc=0
+        out=$(cvar_rows | fzf --delimiter=$'\t' --with-nth=1 --print-query \
+            --header=$'Type to fuzzy search. Enter: edit. No match + Enter: add to server.cfg. Esc: back' \
+            --preview='echo {4}' --preview-window=down:3:wrap) || rc=$?
+        [ "$rc" -le 1 ] || return 0
+        query=$(sed -n 1p <<< "$out")
+        row=$(sed -n 2p <<< "$out")
+        if [ -n "$row" ]; then
+            IFS=$'\t' read -r _ name file desc <<< "$row"
+            edit_cvar "$file" "$name" "$desc"
+        elif [ -n "$query" ] && [[ "$query" =~ ^[A-Za-z_][A-Za-z0-9_.]*$ ]]; then
+            val=$(box --inputbox "New cvar $query in server.cfg" 0 60) || continue
+            set_cvar "$CFG_DIR/server.cfg" "$query" "$val"
+        else
+            return 0
+        fi
+    done
+}
+
+config() {
+    load_env
+    [ -s "$ENV_FILE" ] || save_env
+    local choice
+    while true; do
+        choice=$(box --cancel-button "Exit" --menu "Configure (changes apply on restart)" 0 0 0 \
+            1 "Server settings" \
+            2 "Plugins (enable/disable)" \
+            3 "Plugin API keys" \
+            4 "Whitelist" \
+            5 "Admins" \
+            6 "Search & edit any cvar") || return 0
+        case "$choice" in
+            1) server_settings ;;
+            2) plugins_menu ;;
+            3) api_keys ;;
+            4) whitelist_menu ;;
+            5) admins_menu ;;
+            6) cvar_search ;;
+        esac
+    done
+}
+
+cstr() {
+    local off="$1"
+    tail -c +"$((off + 1))" "$2" | tr '\0' '\n' | head -n1
+}
+
+status() {
+    local LC_ALL=C port="${PORT:-27015}" host f hex chal off name map folder game players max bots
+    host=$(hostname -I 2>/dev/null | awk '{print $1}')
+    f=$(mktemp)
+    exec 3<>"/dev/udp/${host:-127.0.0.1}/$port"
+    printf '\xff\xff\xff\xffTSource Engine Query\x00' >&3
+    timeout 2 dd bs=1400 count=1 status=none <&3 > "$f" || true
+    hex=$(od -An -tx1 -v "$f" | tr -d ' \n')
+    if [ "${hex:8:2}" = "41" ]; then
+        chal=$(sed 's/../\\x&/g' <<< "${hex:10:8}")
+        printf "\xff\xff\xff\xffTSource Engine Query\x00$chal" >&3
+        timeout 2 dd bs=1400 count=1 status=none <&3 > "$f" || true
+        hex=$(od -An -tx1 -v "$f" | tr -d ' \n')
+    fi
+    exec 3>&-
+    if [ "${hex:8:2}" != "49" ]; then
+        echo "No response on UDP $port (still starting?)"
+        rm -f "$f"
+        return 1
+    fi
+    off=6
+    name=$(cstr "$off" "$f");   off=$((off + ${#name} + 1))
+    map=$(cstr "$off" "$f");    off=$((off + ${#map} + 1))
+    folder=$(cstr "$off" "$f"); off=$((off + ${#folder} + 1))
+    game=$(cstr "$off" "$f");   off=$((off + ${#game} + 3))
+    read -r players max bots < <(od -An -tu1 -j "$off" -N3 "$f")
+    rm -f "$f"
+    echo "Hostname: $name"
+    echo "Map:      $map"
+    echo "Players:  $((players - bots))/$max (+$bots bots)"
+}
+
+case "${1:-config}" in
+    config) config ;;
+    status) status ;;
+    *) echo "usage: bhop-tool [config|status]" >&2; exit 1 ;;
+esac

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+C_GREEN='\033[1;32m'
+C_YELLOW='\033[1;33m'
+C_RED='\033[1;31m'
+C_DIM='\033[2m'
+C_OFF='\033[0m'
+
+IMAGE=bhop-css:latest
+CONTAINER=bhop-server
+
+say()  { printf '%b\n' "$*"; }
+fail() { printf '%b\n' "${C_RED}error:${C_OFF} $*" >&2; exit 1; }
+
+command -v docker >/dev/null 2>&1 || fail "docker is not installed. See https://docs.docker.com/get-docker/"
+docker compose version >/dev/null 2>&1 || fail "the 'docker compose' plugin is not installed."
+docker info >/dev/null 2>&1 || fail "cannot reach the docker daemon. Is it running? Are you in the 'docker' group?"
+
+running() {
+    docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true
+}
+
+env_val() {
+    sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" .env 2>/dev/null | tail -n1
+}
+
+confirm() {
+    local reply
+    printf '%s [Y/n] ' "$1"
+    read -r reply
+    case "${reply:-y}" in [nN]*) return 1 ;; esac
+}
+
+configure_firewall() {
+    local port tv_port
+    port=$(env_val PORT)
+    tv_port=$(env_val SOURCETV_PORT)
+    port=${port:-27015}
+    tv_port=${tv_port:-27020}
+    if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
+        say "${C_YELLOW}Active firewall: ufw${C_OFF} — needs ${port}/udp, ${port}/tcp, ${tv_port}/udp open."
+        if confirm "Open these ports via sudo now?"; then
+            sudo ufw allow "${port}/udp" && sudo ufw allow "${port}/tcp" && sudo ufw allow "${tv_port}/udp"
+        else
+            say "Skipped. Run: sudo ufw allow ${port}/udp && sudo ufw allow ${port}/tcp && sudo ufw allow ${tv_port}/udp"
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        say "${C_YELLOW}Active firewall: firewalld${C_OFF} — needs ${port}/udp, ${port}/tcp, ${tv_port}/udp open."
+        if confirm "Open these ports via sudo now?"; then
+            sudo firewall-cmd --add-port="${port}/udp" --permanent \
+            && sudo firewall-cmd --add-port="${port}/tcp" --permanent \
+            && sudo firewall-cmd --add-port="${tv_port}/udp" --permanent \
+            && sudo firewall-cmd --reload
+        else
+            say "Skipped. Run: sudo firewall-cmd --add-port=${port}/udp --permanent && sudo firewall-cmd --add-port=${port}/tcp --permanent && sudo firewall-cmd --add-port=${tv_port}/udp --permanent && sudo firewall-cmd --reload"
+        fi
+    else
+        say "${C_DIM}No managed firewall (ufw/firewalld) active — assuming open.${C_OFF}"
+    fi
+}
+
+ports_closed() {
+    local port rules
+    port=$(env_val PORT)
+    port=${port:-27015}
+    if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
+        rules=$(sudo -n ufw status 2>/dev/null) || return 1
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        rules=$(sudo -n firewall-cmd --list-ports 2>/dev/null) || return 1
+    else
+        return 1
+    fi
+    ! grep -q "${port}/udp" <<< "$rules"
+}
+
+cmd_config() {
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || docker compose build
+    local first=0
+    [ -s .env ] || first=1
+    (umask 077; touch .env)
+    docker run --rm -it \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e HOST_UID="$(id -u)" \
+        -e HOST_GID="$(id -g)" \
+        -v "$PWD/.env:/config/.env" \
+        -v "$PWD/server:/server" \
+        --entrypoint bhop-tool \
+        "$IMAGE" config
+    clear
+    [ "$first" = "1" ] && configure_firewall
+    if running && confirm "Restart the server to apply changes?"; then
+        cmd_restart
+    fi
+}
+
+cmd_start() {
+    [ -s .env ] || cmd_config
+    ports_closed && configure_firewall
+    docker compose up -d --remove-orphans
+    say "${C_GREEN}Server is starting.${C_OFF} First start downloads the game and plugins; follow with ${C_YELLOW}./bhop logs${C_OFF}"
+}
+
+cmd_stop() {
+    docker compose down
+}
+
+cmd_restart() {
+    docker compose up -d --force-recreate --remove-orphans
+}
+
+cmd_update() {
+    say "==> Rebuilding image from scratch"
+    docker compose build --pull --no-cache
+    say "==> Clearing plugin install markers so every plugin re-downloads"
+    rm -rf server/cstrike/addons/sourcemod/.installed
+    say "==> Restarting (game update runs on start)"
+    cmd_restart
+    say "Follow progress with ${C_YELLOW}./bhop logs${C_OFF}"
+}
+
+cmd_console() {
+    running || fail "$CONTAINER is not running. Start it with: ./bhop start"
+    printf '%bAttaching to srcds console.%b\n' "$C_YELLOW" "$C_OFF"
+    printf '  Detach: %bCtrl+P, then Ctrl+Q%b  (do NOT press Ctrl+C — it kills the server)\n\n' "$C_YELLOW" "$C_OFF"
+    exec docker attach --detach-keys=ctrl-p,ctrl-q "$CONTAINER"
+}
+
+cmd_logs() {
+    exec docker compose logs -f --tail 100
+}
+
+cmd_status() {
+    if ! running; then
+        say "Server: ${C_RED}stopped${C_OFF}"
+        return 0
+    fi
+    say "Server:   ${C_GREEN}running${C_OFF} since $(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" | cut -d. -f1)"
+    say "Build:    $(sed -n 's/^ServerVersion=//p' server/cstrike/steam.inf 2>/dev/null)"
+    docker exec "$CONTAINER" bhop-tool status || true
+}
+
+usage() {
+    cat <<EOF
+usage: ./bhop <command>
+  start     configure on first run, then start the server
+  stop      stop the server
+  restart   restart the server (applies .env changes)
+  update    rebuild image, update game + all plugins, restart
+  config    interactive config menu
+  console   attach to the srcds console
+  logs      follow server logs
+  status    running? map, players, version
+  firewall  open the game ports in ufw/firewalld
+EOF
+}
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart ;;
+    update)  cmd_update ;;
+    config)  cmd_config ;;
+    console) cmd_console ;;
+    logs)    cmd_logs ;;
+    status)  cmd_status ;;
+    firewall) configure_firewall ;;
+    *)       usage; exit 1 ;;
+esac
