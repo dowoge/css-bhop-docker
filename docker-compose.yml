@@ -1,0 +1,26 @@
+services:
+  bhop:
+    build: .
+    image: bhop-css:latest
+    container_name: bhop-server
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    network_mode: host
+    volumes:
+      - ./server:/server
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      SV_HOSTNAME: "${SV_HOSTNAME:-CS:S Bhop Server}"
+      MAP: "${MAP:-bhop_furame}"
+      MAXPLAYERS: "${MAXPLAYERS:-16}"
+      TICKRATE: "${TICKRATE:-100}"
+      PORT: "${PORT:-27015}"
+      SV_LAN: "${SV_LAN:-1}"
+      BOT_QUOTA: "${BOT_QUOTA:-1}"
+      MM_VERSION: "${MM_VERSION:-1.12}"
+      SM_VERSION: "${SM_VERSION:-1.12}"
+      DISABLED_PLUGINS: "${DISABLED_PLUGINS:-}"
+      RCON_PASSWORD: "${RCON_PASSWORD:-}"
+      SV_PASSWORD: "${SV_PASSWORD:-}"
