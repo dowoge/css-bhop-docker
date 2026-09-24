@@ -25,6 +25,8 @@ fi
 
 cd "$SRCDS_DIR"
 
+grep -q '^cpu MHz' /proc/cpuinfo || export CPU_MHZ=${CPU_MHZ:-2000}
+
 update_game() {
     "$STEAMCMD" \
         +force_install_dir "$SRCDS_DIR" \
