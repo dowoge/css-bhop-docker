@@ -18,7 +18,8 @@ if [ "$(id -u)" = "0" ]; then
     if [ "$(id -u steam)" != "$PUID" ]; then
         usermod -o -u "$PUID" steam
     fi
-    chown steam:steam "$SRCDS_DIR" /opt/steamcmd
+    chown steam:steam "$SRCDS_DIR"
+    chown -R steam:steam /opt/steamcmd
     exec gosu steam:steam "$0" "$@"
 fi
 
